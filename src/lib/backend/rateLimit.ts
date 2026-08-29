@@ -27,6 +27,12 @@ import { getKV } from './kv';
  * │ RATE_LIMIT_WRITE_WINDOW_SECONDS                 │ api/commitments/settle          │              │ protects both the Soroban network and the operator's signing budget.                      │
  * │                                                 │ api/commitments/early-exit      │              │                                                                                           │
  * ├─────────────────────────────────────────────────┼─────────────────────────────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
+ * │ RATE_LIMIT_EXPORT_MAX_REQUESTS                  │ api/commitments/export          │ 5 / 60 s     │ CSV export fetches the full commitment list from the chain, serialises and streams it;   │
+ * │ RATE_LIMIT_EXPORT_WINDOW_SECONDS                │                                 │              │ the per-request CPU, memory, and bandwidth cost is significantly higher than a typical   │
+ * │                                                 │                                 │              │ read endpoint.  A tighter limit (5 vs. 20) prevents a single client from monopolising   │
+ * │                                                 │                                 │              │ the export worker pool and from harvesting full commitment datasets through rapid        │
+ * │                                                 │                                 │              │ repeated exports.                                                                         │
+ * ├─────────────────────────────────────────────────┼─────────────────────────────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
  * │ RATE_LIMIT_DEFAULT_MAX_REQUESTS                 │ all other routes (fallback)     │ 20 / 60 s    │ General read/query routes; higher ceiling than write routes because they are cheaper to  │
  * │ RATE_LIMIT_DEFAULT_WINDOW_SECONDS               │                                 │              │ serve, but still bounded to deter scraping and denial-of-service.                         │
  * └─────────────────────────────────────────────────┴─────────────────────────────────┴──────────────┴───────────────────────────────────────────────────────────────────────────────────────────┘
@@ -55,6 +61,10 @@ function buildLimits(): Record<string, { windowMs: number; maxRequests: number }
   // Write-heavy routes — tighter limits to protect on-chain operations
   const writeMax = envInt('RATE_LIMIT_WRITE_MAX_REQUESTS', 10);
   const writeWindowSec = envInt('RATE_LIMIT_WRITE_WINDOW_SECONDS', 60);
+  // Export route — resource-intensive (full chain fetch + CSV serialisation + streaming);
+  // tighter than the default bucket to prevent dataset-harvesting and worker exhaustion.
+  const exportMax = envInt('RATE_LIMIT_EXPORT_MAX_REQUESTS', 5);
+  const exportWindowSec = envInt('RATE_LIMIT_EXPORT_WINDOW_SECONDS', 60);
   // Default bucket for all other routes
   const defaultMax = envInt('RATE_LIMIT_DEFAULT_MAX_REQUESTS', 20);
   const defaultWindowSec = envInt('RATE_LIMIT_DEFAULT_WINDOW_SECONDS', 60);
@@ -67,6 +77,8 @@ function buildLimits(): Record<string, { windowMs: number; maxRequests: number }
     'api/commitments/create': { windowMs: writeWindowSec * 1000, maxRequests: writeMax },
     'api/commitments/settle': { windowMs: writeWindowSec * 1000, maxRequests: writeMax },
     'api/commitments/early-exit': { windowMs: writeWindowSec * 1000, maxRequests: writeMax },
+    // Export route — higher resource cost than typical reads
+    'api/commitments/export': { windowMs: exportWindowSec * 1000, maxRequests: exportMax },
     default: { windowMs: defaultWindowSec * 1000, maxRequests: defaultMax },
   };
 }
