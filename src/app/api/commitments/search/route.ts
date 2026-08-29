@@ -8,7 +8,7 @@ import { NextRequest } from 'next/server';
 import { z } from 'zod';
 import { ok, methodNotAllowed } from '@/lib/backend/apiResponse';
 import { createCorsOptionsHandler, type CorsRoutePolicy } from '@/lib/backend/cors';
-import { TooManyRequestsError, ValidationError } from '@/lib/backend/errors';
+import { ForbiddenError, TooManyRequestsError, ValidationError } from '@/lib/backend/errors';
 import { getClientIp } from '@/lib/backend/getClientIp';
 import { logInfo, logWarn } from '@/lib/backend/logger';
 import { checkRateLimit } from '@/lib/backend/rateLimit';
@@ -202,7 +202,8 @@ export const GET = withApiHandler(
     const startedAt = Date.now();
 
     // Authorization before any query parsing, cache lookup, or chain work.
-    requireAuth(req);
+    // requireAuth returns the enriched request with `.user` populated.
+    const authedReq = requireAuth(req);
 
     // 1. Rate limit
     const ip = getClientIp(req);
@@ -221,6 +222,15 @@ export const GET = withApiHandler(
 
     const { ownerAddress, asset, commitmentId, status, riskType, minCompliance } = queryResult.data;
 
+    // ── Scope enforcement ────────────────────────────────────────────────────
+    // The authenticated user may only query their own commitments.
+    // This prevents one wallet from enumerating another wallet's positions.
+    if (authedReq.user.address !== ownerAddress) {
+      throw new ForbiddenError(
+        'ownerAddress does not match the authenticated wallet address.',
+      );
+    }
+
     // 3. Parse pagination & sort via pagination.ts helpers
     let paginationParams;
     let sortParams;
@@ -229,7 +239,7 @@ export const GET = withApiHandler(
       sortParams = parseSortParams(searchParams, SORTABLE_FIELDS, 'createdAt', 'desc');
     } catch (err) {
       if (err instanceof PaginationParseError) {
-        return paginationErrorResponse(err);
+        return paginationErrorResponse(err, correlationId);
       }
       throw err;
     }
@@ -251,16 +261,27 @@ export const GET = withApiHandler(
       data: CommitmentSearchItem[];
       meta: Record<string, unknown>;
       filters: Record<string, unknown>;
+      diagnostics: Record<string, unknown>;
     }>(cacheKey);
 
     if (cached !== null) {
+      const totalDurationMs = Date.now() - startedAt;
       logInfo(req, '[api/commitments/search] served from cache', {
         correlationId,
         ownerAddress,
-        durationMs: Date.now() - startedAt,
+        durationMs: totalDurationMs,
         cacheHit: true,
       });
-      return ok(cached, undefined, 200, correlationId);
+      // Attach updated latency to the cached payload diagnostics before responding.
+      const cachedWithRefreshedDiagnostics = {
+        ...cached,
+        diagnostics: {
+          ...(cached.diagnostics ?? {}),
+          servedFromCache: true,
+          responseLatencyMs: totalDurationMs,
+        },
+      };
+      return ok(cachedWithRefreshedDiagnostics, undefined, 200, correlationId);
     }
 
     // 5. Fetch from chain
@@ -282,6 +303,7 @@ export const GET = withApiHandler(
     }
 
     // 6. Map to search items
+    const filterStartedAt = Date.now();
     let items: CommitmentSearchItem[] = sourceCommitments.map((c: any) => ({
       commitmentId: String(c.id ?? c.commitmentId),
       ownerAddress: c.ownerAddress,
@@ -318,16 +340,34 @@ export const GET = withApiHandler(
     }
 
     if (minCompliance !== undefined) {
+      // minCompliance is already bounds-checked (0–100) by Zod; this is
+      // the runtime application of the filter.
       items = items.filter((c) => c.complianceScore >= minCompliance);
     }
 
     // 8. Sort with stable ordering
     items.sort((a, b) => compareItems(a, b, sortParams.sortBy, sortParams.sortOrder));
 
+    const filterDurationMs = Date.now() - filterStartedAt;
+
     // 9. Paginate
     const result = paginateArray(items, paginationParams);
 
-    // 10. Build response with applied filter metadata
+    const totalDurationMs = Date.now() - startedAt;
+
+    // 10. Build structured diagnostics (no secrets, no stack traces)
+    const diagnostics = {
+      servedFromCache: false,
+      responseLatencyMs: totalDurationMs,
+      chainLatencyMs: chainDurationMs,
+      filterLatencyMs: filterDurationMs,
+      rawCount: commitments.length,
+      filteredCount: items.length,
+      returnedCount: result.data.length,
+      truncated,
+    };
+
+    // 11. Build response with applied filter metadata
     const responsePayload = {
       data: result.data,
       meta: result.meta,
@@ -340,17 +380,20 @@ export const GET = withApiHandler(
         sortBy: sortParams.sortBy,
         sortOrder: sortParams.sortOrder,
       },
+      diagnostics,
     };
 
-    // 11. Cache for short TTL
+    // 12. Cache for short TTL
     await cache.set(cacheKey, responsePayload, CacheTTL.COMMITMENT_SEARCH);
 
     logInfo(req, '[api/commitments/search] served from chain', {
       correlationId,
       ownerAddress,
-      durationMs: Date.now() - startedAt,
+      durationMs: totalDurationMs,
       chainDurationMs,
+      filterDurationMs,
       rawCount: commitments.length,
+      filteredCount: items.length,
       returnedCount: result.data.length,
       total: result.meta.total,
       cacheHit: false,
