@@ -108,11 +108,9 @@ const COMMITMENT_STATUS_VALUES = [
   'VIOLATED',
   'EARLY_EXIT',
 ] as const;
-type CommitmentStatusFilter = (typeof COMMITMENT_STATUS_VALUES)[number];
 
 /** Risk type filter – mirrors `CommitmentType` from domain types. */
 const RISK_TYPE_VALUES = ['Safe', 'Balanced', 'Aggressive'] as const;
-type RiskTypeFilter = (typeof RISK_TYPE_VALUES)[number];
 
 /** Fields available for `sortBy`. */
 const SORTABLE_FIELDS = ['createdAt', 'amount', 'complianceScore', 'status', 'asset'] as const;
